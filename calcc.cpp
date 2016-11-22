@@ -11,13 +11,11 @@
 #include <iostream>
 #include <stdio.h>
 #include <sstream>
+#include <cerrno>
 
 using namespace llvm;
 using namespace std;
 
-static LLVMContext C;
-static IRBuilder<NoFolder> Builder(C);
-static std::unique_ptr<Module> M = llvm::make_unique<Module>("calc", C);
 
 enum Token {
   tok_arg,
@@ -58,10 +56,19 @@ class Lexer {
       return input.at(index);
     }
 
+    char lookbehind() {
+      if (index-2 >= 0) {
+        return input.at(index-2);
+      }
+      else {
+        return '\n';
+      }
+    }
+
   public:
-    int numval;
-    string argname = "";
-    string arithop = "";
+    long numval;
+    int argnum = -1;
+    char arithop = -1;
     string id = "";
     string compop = "";
 
@@ -75,7 +82,7 @@ class Lexer {
       }
 
       // handle comments - currently allows comments not starting at start of line
-      if (current_char == '#') {
+      if (current_char == '#' && lookbehind() == '\n') {
         current_char = getchar();
         while(current_char != '\n') {
           if (current_char == EOF) {
@@ -93,7 +100,10 @@ class Lexer {
           current_char = getchar();
         } while (isdigit(current_char));
 
-        numval = strtod(numstr.c_str(), nullptr);
+        numval = strtol(numstr.c_str(), nullptr, 10);
+        if (errno == ERANGE) {
+          throw throw_err("Number out of range: ", numstr);
+        }
         goback();
         return tok_number;
       }
@@ -107,10 +117,10 @@ class Lexer {
       }
 
       if (current_char == 'a') {
-        argname = "a";
         char next = getchar();
         if('0' <= next && next <= '5') {
-          argname += next;
+          char s[2] = {next, '\0'};
+          argnum = strtod(s, nullptr);
           return tok_arg;
         }
         else {
@@ -142,10 +152,9 @@ class Lexer {
 
       if (current_char == '+' ||
           current_char == '-' ||
-          current_char == '\\' ||
+          current_char == '/' ||
           current_char == '%' ||
           current_char == '*') {
-        arithop = "";
         arithop = current_char;
         return tok_arithop;
       }
@@ -160,7 +169,7 @@ class Lexer {
     string format_token(Token value) {
       std::ostringstream result;
       switch (value) {
-        case (tok_arg) : result << "arg: " << argname; break;
+        case (tok_arg) : result << "arg: " << argnum; break;
         case (tok_arithop) : result << "arithmetic op: " << arithop; break;
         case (tok_compop) : result << "comparison op: " << compop; break;
         case (tok_eof) : result << "EOF"; break;
@@ -177,6 +186,10 @@ class Parser {
   private:
     Lexer &l;
     int counter = 0;
+    LLVMContext &C;
+    IRBuilder<NoFolder> &B;
+    Function *F;
+    std::vector<Value*> &Arguments;
 
     string gensym() {
       std::ostringstream name;
@@ -186,75 +199,118 @@ class Parser {
     }
 
   public:
-    Parser(Lexer &lex) : l(lex) {};
+    Parser(Lexer &lex, IRBuilder<NoFolder> &Barg, LLVMContext &Carg, std::vector<Value*> &Args, Function *Farg) : l(lex), B(Barg), C(Carg), Arguments(Args), F(Farg) {};
 
-    string parse() {
+    Value* parse() {
       Token t = l.gettok();
 
       if (t == tok_number) {
-        return std::to_string(l.numval);
+        return ConstantInt::get(C, APInt(64, l.numval));
       }
 
       if (t == tok_arg) {
-        return l.argname;
+        return Arguments[l.argnum];
       }
 
       if (t == tok_lparen) {
         t = l.gettok();
 
         if (t == tok_arithop) {
-          string op = l.arithop;
-          string lhs = parse();
-          string rhs = parse();
+          char op = l.arithop;
+          llvm::Value* lhs = parse();
+          llvm::Value* rhs = parse();
           check_rparen();
-          std::ostringstream res;
-          string gs = gensym();
-          res << gs << " := " << lhs << ' ' << op << ' ' << rhs;
-          std::cout << res.str() << std::endl;
-          return gs;
+          switch(op) {
+            case '+':
+              return B.CreateNUWAdd(lhs, rhs);
+            case '-':
+              return B.CreateNUWSub(lhs, rhs);
+            case '*':
+              return B.CreateNUWMul(lhs, rhs);
+            case '/':
+              return B.CreateSDiv(lhs, rhs);
+            case '%':
+              return B.CreateSRem(lhs, rhs);
+
+          }
+          throw runtime_error("This should not be reachable");
         }
         else if (t == tok_id && l.id == "if") {
-          string op = l.arithop;
-          string B = parseBool();
-          string exp1 = parse();
-          string exp2 = parse();
+          BasicBlock *BB1 = BasicBlock::Create(C, "cond1", F);
+          BasicBlock *BB2 = BasicBlock::Create(C, "cond2", F);
+          BasicBlock *BB3 = BasicBlock::Create(C, "merge", F);
+
+          llvm::Value* boolcond = parseBool();
+          B.CreateCondBr(boolcond, BB1, BB2);
+
+          B.SetInsertPoint(BB1);
+          llvm::Value* exp1 = parse();
+          B.CreateBr(BB3);
+
+          B.SetInsertPoint(BB2);
+          llvm::Value* exp2 = parse();
+          B.CreateBr(BB3);
+
+          B.SetInsertPoint(BB3);
+          PHINode* phi = B.CreatePHI(Type::getInt64Ty(C), 2);
+          phi->addIncoming(exp1, BB1);
+          //phi->setIncomingBlock(1, BB1);
+          phi->addIncoming(exp2, BB2);
+          //phi->setIncomingBlock(2, BB2);
           check_rparen();
-          std::ostringstream res;
-          string gs = gensym();
-          res << gs << " := " << " IF " << B << ' ' << exp1 << " ELSE " << exp2;
-          std::cout << res.str() << std::endl;
-          return gs;
+
+          return phi;
         }
         else {
           throw throw_err("Expected 'if' or arithmetic operator but found: ", l.format_token(t));
         }
       }
 
-    throw throw_err("Invalid start of arithmetic expression: ", l.format_token(t));
+      throw throw_err("Invalid start of arithmetic expression: ", l.format_token(t));
     }
-// (if true 1 2)
-// (if (> 2 1) 1 2)
-    string parseBool() {
+    Value* parseBool() {
       Token t = l.gettok();
       if (t == tok_lparen) {
         t = l.gettok();
         if (t == tok_compop) {
-         string op = l.compop;
-         string lhs = parse();
-         string rhs = parse();
-         check_rparen();
-         std::ostringstream res;
-         string gs = gensym();
-         res << gs << " := " << lhs << ' ' << op << ' ' << rhs;
-         std::cout << res.str() << std::endl;
-         return gs;
+          string op = l.compop;
+          llvm::Value* lhs = parse();
+          llvm::Value* rhs = parse();
+          check_rparen();
+          if (op == ">=") {
+            return B.CreateICmpSGE(lhs, rhs);
+          }
+          else if (op == "<=") {
+            return B.CreateICmpSLE(lhs, rhs);
+          }
+          else if (op == "==") {
+            return B.CreateICmpEQ(lhs, rhs);
+          }
+          else if (op == "!=") {
+            return B.CreateICmpNE(lhs, rhs);
+          }
+          else if (op == "<") {
+            return B.CreateICmpSLT(lhs, rhs);
+          }
+          else if (op == ">") {
+            return B.CreateICmpSGT(lhs, rhs);
+          }
+          else if (op == ">=") {
+            return B.CreateICmpSGE(lhs, rhs);
+          }
+          else {
+            throw throw_err("Invalid operation: ", op);
+          }
         }
         else {
           throw throw_err("Expected comparison operator but found: ", l.format_token(t));
         }
       }
-      else if (t == tok_id && (l.id == "false" || l.id == "true")) {
-        return l.id;
+      else if (t == tok_id && l.id == "true") {
+        return ConstantInt::get(C, APInt(1, 1));
+      }
+      else if (t == tok_id && l.id == "false") {
+        return ConstantInt::get(C, APInt(1, 0));
       }
       else {
         throw throw_err("Invalid start of boolean expression; found: ", l.format_token(t));
@@ -273,47 +329,60 @@ class Parser {
 
 /// top ::= definition | external | expression | ';'
 //static void MainLoop() {
-  //while (true) {
-   //// fprintf(stderr, "ready> ");
-    //switch (CurTok) {
-    //case tok_eof:
-      //printf("EOM");
-      //return;
-    //case tok_number:
-      //printf("number");
-    ////case ';': // ignore top-level semicolons.
-    ////  getNextToken();
-    ////  break;
-    ////case tok_def:
-    ////  HandleDefinition();
-    ////  break;
-    ////case tok_extern:
-    ////  HandleExtern();
-    ////  break;
-    //default:
-      //printf("default");
-      ////break;
-      //return;
-    //}
-  //}
+//while (true) {
+//// fprintf(stderr, "ready> ");
+//switch (CurTok) {
+//case tok_eof:
+//printf("EOM");
+//return;
+//case tok_number:
+//printf("number");
+////case ';': // ignore top-level semicolons.
+////  getNextToken();
+////  break;
+////case tok_def:
+////  HandleDefinition();
+////  break;
+////case tok_extern:
+////  HandleExtern();
+////  break;
+//default:
+//printf("default");
+////break;
+//return;
+//}
+//}
 //}
 
 static int compile() {
-  //M->setTargetTriple(llvm::sys::getProcessTriple());
-  //std::vector<Type *> SixInts(6, Type::getInt64Ty(C));
-  //FunctionType *FT = FunctionType::get(Type::getInt64Ty(C), SixInts, false);
-  //Function *F = Function::Create(FT, Function::ExternalLinkage, "f", &*M);
-  //BasicBlock *BB = BasicBlock::Create(C, "entry", F);
-  //Builder.SetInsertPoint(BB);
+  LLVMContext C;
+  IRBuilder<NoFolder> Builder(C);
+  std::unique_ptr<Module> M = llvm::make_unique<Module>("calc", C);
+
+  M->setTargetTriple(llvm::sys::getProcessTriple());
+  std::vector<Type *> SixInts(6, Type::getInt64Ty(C));
+  FunctionType *FT = FunctionType::get(Type::getInt64Ty(C), SixInts, false);
+  Function *F = Function::Create(FT, Function::ExternalLinkage, "f", &*M);
+  BasicBlock *BB = BasicBlock::Create(C, "entry", F);
+  Builder.SetInsertPoint(BB);
+  std::vector<Value*> vector;
+
+  for (auto &arg : F->args()) {
+    vector.push_back(&arg);
+  }
+
   std::ostringstream std_input;
   std_input << std::cin.rdbuf() << ((char) EOF);
   std::string s = std_input.str();
 
+  Value *RetVal;
+
+
 
   try {
     Lexer l = Lexer(s);
-    Parser p = Parser(l);
-    std::cout << p.parse() << std::endl;
+    Parser p = Parser(l, Builder, C, vector, F);
+    RetVal = p.parse();
     Token t = l.gettok();
     if (t != tok_eof) {
       throw throw_err("Expected EOF but found: ", l.format_token(t));
@@ -321,26 +390,16 @@ static int compile() {
   }
   catch (std::exception &e) {
     std::cerr << "caught exception: " << e.what() << std::endl;
+    return 1;
   }
 
-  /*try {
-    while(true) {
-      Lexer::Token t = l.gettok();
-      //std::cout << t << std::endl;
-      std::cout << l.format_token(t) << std::endl;
-      if(t == Lexer::tok_eof) { break; }
-    }
-  }
-  catch (std::exception &e) { std::cerr << "caught exception: " << e.what() << std::endl; }
-  */
 
   // TODO: generate correct LLVM instead of just an empty function
 
   //Value *RetVal = ConstantInt::get(C, APInt(64, 0));
-  //Builder.CreateRet(RetVal);
-  //assert(!verifyModule(*M));
-  //M->dump();
-
+  Builder.CreateRet(RetVal);
+  M->dump();
+  assert(!verifyModule(*M));
   return 0;
 }
 

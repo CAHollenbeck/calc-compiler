@@ -24,12 +24,13 @@ enum Token {
   tok_id,
   tok_lparen,
   tok_compop,
-  tok_rparen,
-  tok_number
+  tok_mut,
+  tok_number,
+  tok_rparen
 } typedef Token;
 
 template<typename T>
-runtime_error throw_err(string message, T item) {
+runtime_error format_err(string message, T item) {
   std::ostringstream err_msg;
   err_msg << message << item;
   return runtime_error(err_msg.str());
@@ -102,7 +103,7 @@ class Lexer {
 
         numval = strtol(numstr.c_str(), nullptr, 10);
         if (errno == ERANGE) {
-          throw throw_err("Number out of range: ", numstr);
+          throw format_err("Number out of range: ", numstr);
         }
         goback();
         return tok_number;
@@ -124,10 +125,22 @@ class Lexer {
           return tok_arg;
         }
         else {
-          throw throw_err("Not a valid argument name: a", next);
+          throw format_err("Not a valid argument name: a", next);
         }
-        return tok_arg;
       }
+
+      if (current_char == 'm') {
+        char next = getchar();
+        if('0' <= next && next <= '9') {
+          char s[2] = {next, '\0'};
+          argnum = strtod(s, nullptr);
+          return tok_mut;
+        }
+        else {
+          throw format_err("Not a valid mutable name: a", next);
+        }
+      }
+
 
       if (isalpha(current_char)) {
         id = "";
@@ -163,7 +176,7 @@ class Lexer {
         return tok_eof;
       }
 
-      throw throw_err("Lexer error on: ", current_char);
+      throw format_err("Lexer error on: ", current_char);
     }
 
     string format_token(Token value) {
@@ -175,6 +188,7 @@ class Lexer {
         case (tok_eof) : result << "EOF"; break;
         case (tok_id) : result << "id: " << id; break;
         case (tok_lparen) : result << "lparen"; break;
+        case (tok_mut) : result << "mutable: " << argnum; break;
         case (tok_number) : result << "number: " << numval; break;
         case (tok_rparen) : result << "rparen"; break;
       }
@@ -213,6 +227,10 @@ class Parser {
         return Arguments[l.argnum];
       }
 
+      if (t == tok_mut) {
+        return B.CreateLoad(Mutables[l.argnum], "m");
+      }
+
       if (t == tok_lparen) {
         t = l.gettok();
 
@@ -232,7 +250,6 @@ class Parser {
               return B.CreateSDiv(lhs, rhs);
             case '%':
               return B.CreateSRem(lhs, rhs);
-
           }
           throw runtime_error("This should not be reachable");
         }
@@ -262,12 +279,24 @@ class Parser {
 
           return phi;
         }
+        else if (t == tok_id && l.id == "set") {
+          llvm::Value* exp = parse();
+          t = l.gettok();
+          if (t == tok_mut) {
+            B.CreateStore(exp, Mutables[l.argnum]);
+            check_rparen();
+            return exp;
+          }
+          else {
+            throw format_err("Expected mutable but found: ", l.format_token(t));
+          }
+        }
         else {
-          throw throw_err("Expected 'if' or arithmetic operator but found: ", l.format_token(t));
+          throw format_err("Expected 'if' or arithmetic operator but found: ", l.format_token(t));
         }
       }
 
-      throw throw_err("Invalid start of arithmetic expression: ", l.format_token(t));
+      throw format_err("Invalid start of arithmetic expression: ", l.format_token(t));
     }
     Value* parseBool() {
       Token t = l.gettok();
@@ -300,11 +329,11 @@ class Parser {
             return B.CreateICmpSGE(lhs, rhs);
           }
           else {
-            throw throw_err("Invalid operation: ", op);
+            throw format_err("Invalid operation: ", op);
           }
         }
         else {
-          throw throw_err("Expected comparison operator but found: ", l.format_token(t));
+          throw format_err("Expected comparison operator but found: ", l.format_token(t));
         }
       }
       else if (t == tok_id && l.id == "true") {
@@ -314,14 +343,14 @@ class Parser {
         return ConstantInt::get(C, APInt(1, 0));
       }
       else {
-        throw throw_err("Invalid start of boolean expression; found: ", l.format_token(t));
+        throw format_err("Invalid start of boolean expression; found: ", l.format_token(t));
       }
     }
 
     void check_rparen() {
       Token t = l.gettok();
       if (t != tok_rparen) {
-        throw throw_err("Expected ')' but found: ", l.format_token(t));
+        throw format_err("Expected ')' but found: ", l.format_token(t));
       }
     }
 };
@@ -375,7 +404,9 @@ static int compile() {
   }
 
   for (int i = 0; i < 10; i++) {
-    mutables.push_back(Builder.CreateAlloca(Type::getInt64Ty(C)));
+    Value* ptr = Builder.CreateAlloca(Type::getInt64Ty(C));
+    mutables.push_back(ptr);
+    Builder.CreateStore(ConstantInt::get(C, APInt(64, 0)), ptr);
   }
 
   std::ostringstream std_input;
@@ -392,7 +423,7 @@ static int compile() {
     RetVal = p.parse();
     Token t = l.gettok();
     if (t != tok_eof) {
-      throw throw_err("Expected EOF but found: ", l.format_token(t));
+      throw format_err("Expected EOF but found: ", l.format_token(t));
     }
   }
   catch (std::exception &e) {

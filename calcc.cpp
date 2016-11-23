@@ -190,6 +190,7 @@ class Parser {
     IRBuilder<NoFolder> &B;
     Function *F;
     std::vector<Value*> &Arguments;
+    std::vector<Value*> &Mutables;
 
     string gensym() {
       std::ostringstream name;
@@ -199,7 +200,7 @@ class Parser {
     }
 
   public:
-    Parser(Lexer &lex, IRBuilder<NoFolder> &Barg, LLVMContext &Carg, std::vector<Value*> &Args, Function *Farg) : l(lex), B(Barg), C(Carg), Arguments(Args), F(Farg) {};
+    Parser(Lexer &lex, IRBuilder<NoFolder> &Barg, LLVMContext &Carg, std::vector<Value*> &Args, Function *Farg, std::vector<Value*> &Muts) : l(lex), B(Barg), C(Carg), Arguments(Args), Mutables(Muts), F(Farg) {};
 
     Value* parse() {
       Token t = l.gettok();
@@ -245,18 +246,18 @@ class Parser {
 
           B.SetInsertPoint(BB1);
           llvm::Value* exp1 = parse();
+          BasicBlock *e1block = B.GetInsertBlock();
           B.CreateBr(BB3);
 
           B.SetInsertPoint(BB2);
           llvm::Value* exp2 = parse();
+          BasicBlock *e2block = B.GetInsertBlock();
           B.CreateBr(BB3);
 
           B.SetInsertPoint(BB3);
           PHINode* phi = B.CreatePHI(Type::getInt64Ty(C), 2);
-          phi->addIncoming(exp1, BB1);
-          //phi->setIncomingBlock(1, BB1);
-          phi->addIncoming(exp2, BB2);
-          //phi->setIncomingBlock(2, BB2);
+          phi->addIncoming(exp1, e1block);
+          phi->addIncoming(exp2, e2block);
           check_rparen();
 
           return phi;
@@ -365,10 +366,16 @@ static int compile() {
   Function *F = Function::Create(FT, Function::ExternalLinkage, "f", &*M);
   BasicBlock *BB = BasicBlock::Create(C, "entry", F);
   Builder.SetInsertPoint(BB);
-  std::vector<Value*> vector;
+
+  std::vector<Value*> args;
+  std::vector<Value*> mutables;
 
   for (auto &arg : F->args()) {
-    vector.push_back(&arg);
+    args.push_back(&arg);
+  }
+
+  for (int i = 0; i < 10; i++) {
+    mutables.push_back(Builder.CreateAlloca(Type::getInt64Ty(C)));
   }
 
   std::ostringstream std_input;
@@ -381,7 +388,7 @@ static int compile() {
 
   try {
     Lexer l = Lexer(s);
-    Parser p = Parser(l, Builder, C, vector, F);
+    Parser p = Parser(l, Builder, C, args, F, mutables);
     RetVal = p.parse();
     Token t = l.gettok();
     if (t != tok_eof) {

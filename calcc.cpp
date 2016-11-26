@@ -200,11 +200,11 @@ class Parser {
   private:
     Lexer &l;
     int counter = 0;
-    LLVMContext &C;
     IRBuilder<NoFolder> &B;
-    Function *F;
+    LLVMContext &C;
     std::vector<Value*> &Arguments;
     std::vector<Value*> &Mutables;
+    Function *F;
 
     string gensym() {
       std::ostringstream name;
@@ -291,6 +291,41 @@ class Parser {
             throw format_err("Expected mutable but found: ", l.format_token(t));
           }
         }
+        else if (t == tok_id && l.id == "seq") {
+          parse();
+          llvm::Value* exp2 = parse();
+          check_rparen();
+          return exp2;
+        }
+        else if (t == tok_id && l.id == "while") {
+          BasicBlock *whilecond = BasicBlock::Create(C, "whilecond", F);
+          BasicBlock *dothing = BasicBlock::Create(C, "dothing", F);
+          BasicBlock *resume = BasicBlock::Create(C, "resume", F);
+
+          BasicBlock *before = B.GetInsertBlock(); // whatever came before the condition
+          llvm::ConstantInt *b4 = ConstantInt::get(C, APInt(64, 0));
+          B.CreateBr(whilecond);
+
+          // whilecond
+          B.SetInsertPoint(whilecond);
+          PHINode* phi = B.CreatePHI(Type::getInt64Ty(C), 2);
+          llvm::Value* cond = parseBool();
+          B.CreateCondBr(cond, dothing, resume);
+
+          // dothing
+          B.SetInsertPoint(dothing);
+          llvm::Value* thing = parse();
+          BasicBlock *bodyreturn = B.GetInsertBlock();
+          B.CreateBr(whilecond);
+
+          phi->addIncoming(b4, before);
+          phi->addIncoming(thing, bodyreturn);
+
+          // resume
+          B.SetInsertPoint(resume);
+          check_rparen();
+          return phi;
+          }
         else {
           throw format_err("Expected 'if' or arithmetic operator but found: ", l.format_token(t));
         }
@@ -354,35 +389,6 @@ class Parser {
       }
     }
 };
-
-
-
-/// top ::= definition | external | expression | ';'
-//static void MainLoop() {
-//while (true) {
-//// fprintf(stderr, "ready> ");
-//switch (CurTok) {
-//case tok_eof:
-//printf("EOM");
-//return;
-//case tok_number:
-//printf("number");
-////case ';': // ignore top-level semicolons.
-////  getNextToken();
-////  break;
-////case tok_def:
-////  HandleDefinition();
-////  break;
-////case tok_extern:
-////  HandleExtern();
-////  break;
-//default:
-//printf("default");
-////break;
-//return;
-//}
-//}
-//}
 
 static int compile() {
   LLVMContext C;

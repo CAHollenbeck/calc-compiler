@@ -38,7 +38,6 @@ runtime_error format_err(string message, T item) {
 
 class Lexer {
   private:
-    int index = 0;
     std::string &input;
 
     bool iscomp(char c) {
@@ -67,6 +66,7 @@ class Lexer {
     }
 
   public:
+    int index = 0;
     long numval;
     int argnum = -1;
     char arithop = -1;
@@ -216,7 +216,7 @@ class Parser {
       return name.str();
     }
 
-    Value* create_intrinsic_call(llvm::Intrinsic::ID intrinsic, llvm::Value* lhs, llvm::Value* rhs) {
+    Value* create_intrinsic_call(llvm::Intrinsic::ID intrinsic, llvm::Value* lhs, llvm::Value* rhs, int idx) {
       std::vector<Value *> ArgsV;
       ArgsV.push_back(lhs);
       ArgsV.push_back(rhs);
@@ -225,19 +225,19 @@ class Parser {
       CallInst *c = B.CreateCall(Intrinsic::getDeclaration(M, intrinsic, typesV), ArgsV);
       Value* sum = B.CreateExtractValue(c, (uint64_t) 0);
       Value* obit = B.CreateExtractValue(c, (uint64_t) 1);
-      create_overflow_branch(obit);
+      create_overflow_branch(obit, idx);
 
       return sum;
     }
 
-    void create_overflow_branch(Value* obit) {
+    void create_overflow_branch(Value* obit, int idx) {
       BasicBlock *fail = BasicBlock::Create(C, "fail", F);
       BasicBlock *els = BasicBlock::Create(C, "else", F);
       B.CreateCondBr(obit, fail, els);
 
       B.SetInsertPoint(fail);
       std::vector<Value*> overflow_args;
-      overflow_args.push_back(ConstantInt::get(C, APInt(32, 0)));
+      overflow_args.push_back(ConstantInt::get(C, APInt(32, idx)));
       B.CreateCall(M->getFunction("overflow_fail"), overflow_args);
       B.CreateBr(els);
       B.SetInsertPoint(els);
@@ -266,17 +266,18 @@ class Parser {
 
         if (t == tok_arithop) {
           char op = l.arithop;
+          int idx = l.index - 1;
           llvm::Value* lhs = parse();
           llvm::Value* rhs = parse();
           check_rparen();
           if(overflow) {
             switch(op) {
               case '+':
-                return create_intrinsic_call(Intrinsic::sadd_with_overflow, lhs, rhs);
+                return create_intrinsic_call(Intrinsic::sadd_with_overflow, lhs, rhs, idx);
               case '-':
-                return create_intrinsic_call(Intrinsic::ssub_with_overflow, lhs, rhs);
+                return create_intrinsic_call(Intrinsic::ssub_with_overflow, lhs, rhs, idx);
               case '*':
-                return create_intrinsic_call(Intrinsic::smul_with_overflow, lhs, rhs);
+                return create_intrinsic_call(Intrinsic::smul_with_overflow, lhs, rhs, idx);
               case '/':
                 return B.CreateSDiv(lhs, rhs);
               case '%':

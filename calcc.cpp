@@ -196,6 +196,7 @@ class Lexer {
     }
 };
 
+
 class Parser {
   private:
     Lexer &l;
@@ -205,6 +206,8 @@ class Parser {
     std::vector<Value*> &Arguments;
     std::vector<Value*> &Mutables;
     Function *F;
+    bool overflow;
+    Module *M;
 
     string gensym() {
       std::ostringstream name;
@@ -213,8 +216,35 @@ class Parser {
       return name.str();
     }
 
+    Value* create_intrinsic_call(llvm::Intrinsic::ID intrinsic, llvm::Value* lhs, llvm::Value* rhs) {
+      std::vector<Value *> ArgsV;
+      ArgsV.push_back(lhs);
+      ArgsV.push_back(rhs);
+      std::vector<Type*> typesV;
+      typesV.push_back(Type::getInt64Ty(C));
+      CallInst *c = B.CreateCall(Intrinsic::getDeclaration(M, intrinsic, typesV), ArgsV);
+      Value* sum = B.CreateExtractValue(c, (uint64_t) 0);
+      Value* obit = B.CreateExtractValue(c, (uint64_t) 1);
+      create_overflow_branch(obit);
+
+      return sum;
+    }
+
+    void create_overflow_branch(Value* obit) {
+      BasicBlock *fail = BasicBlock::Create(C, "fail", F);
+      BasicBlock *els = BasicBlock::Create(C, "else", F);
+      B.CreateCondBr(obit, fail, els);
+
+      B.SetInsertPoint(fail);
+      std::vector<Value*> overflow_args;
+      overflow_args.push_back(ConstantInt::get(C, APInt(32, 0)));
+      B.CreateCall(M->getFunction("overflow_fail"), overflow_args);
+      B.CreateBr(els);
+      B.SetInsertPoint(els);
+    }
+
   public:
-    Parser(Lexer &lex, IRBuilder<NoFolder> &Barg, LLVMContext &Carg, std::vector<Value*> &Args, Function *Farg, std::vector<Value*> &Muts) : l(lex), B(Barg), C(Carg), Arguments(Args), Mutables(Muts), F(Farg) {};
+    Parser(Lexer &lex, IRBuilder<NoFolder> &Barg, LLVMContext &Carg, std::vector<Value*> &Args, Function *Farg, std::vector<Value*> &Muts, bool overarg, Module *Marg) : l(lex), B(Barg), C(Carg), Arguments(Args), Mutables(Muts), F(Farg), overflow(overarg), M(Marg) {};
 
     Value* parse() {
       Token t = l.gettok();
@@ -239,17 +269,33 @@ class Parser {
           llvm::Value* lhs = parse();
           llvm::Value* rhs = parse();
           check_rparen();
-          switch(op) {
-            case '+':
-              return B.CreateNUWAdd(lhs, rhs);
-            case '-':
-              return B.CreateNUWSub(lhs, rhs);
-            case '*':
-              return B.CreateNUWMul(lhs, rhs);
-            case '/':
-              return B.CreateSDiv(lhs, rhs);
-            case '%':
-              return B.CreateSRem(lhs, rhs);
+          if(overflow) {
+            switch(op) {
+              case '+':
+                return create_intrinsic_call(Intrinsic::sadd_with_overflow, lhs, rhs);
+              case '-':
+                return create_intrinsic_call(Intrinsic::ssub_with_overflow, lhs, rhs);
+              case '*':
+                return create_intrinsic_call(Intrinsic::smul_with_overflow, lhs, rhs);
+              case '/':
+                return B.CreateSDiv(lhs, rhs);
+              case '%':
+                return B.CreateSRem(lhs, rhs);
+            }
+          }
+          else {
+            switch(op) {
+              case '+':
+                return B.CreateNUWAdd(lhs, rhs);
+              case '-':
+                return B.CreateNUWSub(lhs, rhs);
+              case '*':
+                return B.CreateNUWMul(lhs, rhs);
+              case '/':
+                return B.CreateSDiv(lhs, rhs);
+              case '%':
+                return B.CreateSRem(lhs, rhs);
+            }
           }
           throw runtime_error("This should not be reachable");
         }
@@ -390,15 +436,22 @@ class Parser {
     }
 };
 
-static int compile() {
+static int compile(bool overflow) {
   LLVMContext C;
   IRBuilder<NoFolder> Builder(C);
-  std::unique_ptr<Module> M = llvm::make_unique<Module>("calc", C);
+  //std::unique_ptr<Module> M = llvm::make_unique<Module>("calc", C);
+  Module *M = new Module("calc", C);
 
   M->setTargetTriple(llvm::sys::getProcessTriple());
+
   std::vector<Type *> SixInts(6, Type::getInt64Ty(C));
   FunctionType *FT = FunctionType::get(Type::getInt64Ty(C), SixInts, false);
   Function *F = Function::Create(FT, Function::ExternalLinkage, "f", &*M);
+
+  std::vector<Type *> OneInt(1, Type::getInt32Ty(C));
+  FunctionType *OverflowFailType = FunctionType::get(Type::getVoidTy(C), OneInt, false);
+  M->getOrInsertFunction("overflow_fail", OverflowFailType);
+
   BasicBlock *BB = BasicBlock::Create(C, "entry", F);
   Builder.SetInsertPoint(BB);
 
@@ -421,11 +474,9 @@ static int compile() {
 
   Value *RetVal;
 
-
-
   try {
     Lexer l = Lexer(s);
-    Parser p = Parser(l, Builder, C, args, F, mutables);
+    Parser p = Parser(l, Builder, C, args, F, mutables, overflow, M);
     RetVal = p.parse();
     Token t = l.gettok();
     if (t != tok_eof) {
@@ -437,10 +488,6 @@ static int compile() {
     return 1;
   }
 
-
-  // TODO: generate correct LLVM instead of just an empty function
-
-  //Value *RetVal = ConstantInt::get(C, APInt(64, 0));
   Builder.CreateRet(RetVal);
   M->dump();
   assert(!verifyModule(*M));
@@ -448,4 +495,14 @@ static int compile() {
 }
 
 
-int main(void) { return compile(); }
+int main(int argc, char* argv[]) {
+  bool overflow = false;
+  if (argc == 1) { }
+  else if (argc == 2 && (strcmp(argv[1], "-check") == 0)) {
+    overflow = true;
+  }
+  else {
+    std::cerr << "Usage: calcc [-check]" << std::endl;
+    return 1;
+  }
+  return compile(overflow); }
